@@ -12,6 +12,11 @@ pub const Info = struct {
     has_start_bits: bool = false,
     /// A later literal that must appear in a match. Used when start_bits are wide.
     req_byte: ?u8 = null,
+    /// A later mandatory ASCII string, after the start atom. Used even when a
+    /// prefix exists: a common prefix plus a rare tail (`status=500`) should
+    /// skip on the tail.
+    req_lit: [32]u8 = undefined,
+    req_lit_len: u8 = 0,
 };
 
 const StartSet = struct {
@@ -106,6 +111,7 @@ pub fn analyze(program: bytecode.Program) Info {
     if (info.has_start_bits and set.bitCount() > 8) {
         info.req_byte = requiredLiteral(program, info.start_bits);
     }
+    fillRequiredLater(program, &info);
     return info;
 }
 
@@ -121,6 +127,99 @@ fn requiredLiteral(program: bytecode.Program, bits: [4]u64) ?u8 {
         }
     }
     return null;
+}
+
+/// Longest ASCII `.char` run that must appear after the start atom.
+/// Conservative: never take bytes from a split, optional quant, or lookaround.
+fn fillRequiredLater(program: bytecode.Program, info: *Info) void {
+    var best: [32]u8 = undefined;
+    var best_len: u8 = 0;
+    var run: [32]u8 = undefined;
+    var run_len: u8 = 0;
+    var past_start = false;
+    var i: usize = 0;
+
+    const flush = struct {
+        fn go(
+            past: *bool,
+            run_buf: []u8,
+            run_n: *u8,
+            best_buf: *[32]u8,
+            best_n: *u8,
+        ) void {
+            if (past.* and run_n.* >= 3 and run_n.* >= best_n.*) {
+                @memcpy(best_buf[0..run_n.*], run_buf[0..run_n.*]);
+                best_n.* = run_n.*;
+            }
+            if (run_n.* > 0) past.* = true;
+            run_n.* = 0;
+        }
+    }.go;
+
+    while (i < program.ops.len) {
+        switch (program.ops[i]) {
+            .save, .commit, .reset_start => i += 1,
+            .bol, .eol, .bot, .eot, .eot_nl, .word_boundary, .not_word_boundary, .start_match => i += 1,
+            .char => |cp| {
+                if (cp > 127) {
+                    flush(&past_start, &run, &run_len, &best, &best_len);
+                    past_start = true;
+                    i += 1;
+                    continue;
+                }
+                if (run_len < run.len) {
+                    run[run_len] = @intCast(cp);
+                    run_len += 1;
+                }
+                i += 1;
+            },
+            .quant => |q| {
+                flush(&past_start, &run, &run_len, &best, &best_len);
+                past_start = true;
+                i = q.body_end;
+            },
+            .split => |alt| {
+                flush(&past_start, &run, &run_len, &best, &best_len);
+                past_start = true;
+                if (alt == 0 or alt > program.ops.len or alt < 1) break;
+                switch (program.ops[alt - 1]) {
+                    .jmp => |join| {
+                        if (join < alt) break;
+                        i = join;
+                    },
+                    else => break,
+                }
+            },
+            .jmp => |t| {
+                flush(&past_start, &run, &run_len, &best, &best_len);
+                if (t <= i) break;
+                i = t;
+            },
+            .look => |l| {
+                flush(&past_start, &run, &run_len, &best, &best_len);
+                i = l.end;
+            },
+            .cond_group => |cg| {
+                flush(&past_start, &run, &run_len, &best, &best_len);
+                past_start = true;
+                i = cg.end;
+            },
+            .accept, .accept_verb, .fail, .prune, .skip, .then => break,
+            else => {
+                flush(&past_start, &run, &run_len, &best, &best_len);
+                past_start = true;
+                i += 1;
+            },
+        }
+    }
+    flush(&past_start, &run, &run_len, &best, &best_len);
+
+    if (best_len < 3) return;
+    if (info.prefix_len >= 2 and best_len == info.prefix_len and
+        std.mem.eql(u8, best[0..best_len], info.prefix[0..info.prefix_len]))
+        return;
+    info.req_lit = best;
+    info.req_lit_len = best_len;
 }
 
 fn collect(program: bytecode.Program, start_pc: u32, end_pc: u32, set: *StartSet, depth: u8) void {

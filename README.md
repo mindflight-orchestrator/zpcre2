@@ -13,7 +13,7 @@ Early implementation. Syntax coverage grows toward PCRE2 10.47. Unsupported cons
 | Spec | PCRE2 10.47 (8-bit / UTF-8) |
 | Toolchain | Zig 0.16.0 |
 | C / libc | none in the library |
-| JIT | none (comptime is the AOT path) |
+| JIT | none yet. `compile` bakes bytecode at comptime; match is still the interpreter. CLI patterns use `compileAlloc` at runtime. |
 
 ## Quick start
 

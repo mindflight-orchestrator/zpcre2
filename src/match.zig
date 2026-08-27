@@ -125,6 +125,18 @@ fn skipToCandidate(subject: []const u8, pos: usize, info: analyze.Info) ?Candida
     if (pos == subject.len) {
         return if (info.min_length == 0) .{ .start = pos, .next = pos + 1 } else null;
     }
+    if (info.req_lit_len >= 3) {
+        const needle = info.req_lit[0..info.req_lit_len];
+        var search = pos;
+        while (search < subject.len) {
+            const rel = std.mem.find(u8, subject[search..], needle) orelse return null;
+            const at = search + rel;
+            if (startInWindow(subject, pos, at, info)) |start|
+                return .{ .start = start, .next = start + 1 };
+            search = at + 1;
+        }
+        return null;
+    }
     if (info.req_byte) |rb| {
         if (std.mem.findScalarPos(u8, subject, pos, rb)) |at| {
             var start = at;
@@ -160,6 +172,38 @@ fn skipToCandidate(subject: []const u8, pos: usize, info: analyze.Info) ?Candida
 
 fn bitAt(bits: [4]u64, b: u8) bool {
     return (bits[b >> 6] & (@as(u64, 1) << @as(u6, @truncate(b)))) != 0;
+}
+
+fn startInWindow(subject: []const u8, pos: usize, req_at: usize, info: analyze.Info) ?usize {
+    if (pos > req_at) return null;
+    if (info.prefix_len >= 2) {
+        const hay = subject[pos..req_at];
+        const needle = info.prefix[0..info.prefix_len];
+        if (std.mem.find(u8, hay, needle)) |rel| return pos + rel;
+        return null;
+    }
+    if (info.first_byte) |b| {
+        var p = pos;
+        while (p <= req_at) {
+            const idx = if (info.first_byte2) |b2| blk: {
+                const a = std.mem.findScalarPos(u8, subject, p, b);
+                const c = std.mem.findScalarPos(u8, subject, p, b2);
+                if (a == null and c == null) break :blk null;
+                break :blk @min(a orelse std.math.maxInt(usize), c orelse std.math.maxInt(usize));
+            } else std.mem.findScalarPos(u8, subject, p, b);
+            const found = idx orelse return null;
+            if (found > req_at) return null;
+            if (prefixMatches(subject, found, info)) return found;
+            p = found + 1;
+        }
+        return null;
+    }
+    if (info.has_start_bits) {
+        const found = findStartBit(subject, pos, info.start_bits) orelse return null;
+        if (found > req_at) return null;
+        return found;
+    }
+    return pos;
 }
 
 fn prefixMatches(subject: []const u8, idx: usize, info: analyze.Info) bool {

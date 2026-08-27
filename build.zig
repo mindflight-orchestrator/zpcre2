@@ -40,6 +40,17 @@ pub fn build(b: *std.Build) void {
     run_spec.has_side_effects = true;
     test_step.dependOn(&run_spec.step);
 
+    const study_mod = b.createModule(.{
+        .root_source_file = b.path("tests/study.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zpcre2", .module = zpcre2 }},
+    });
+    const study_tests = b.addTest(.{ .root_module = study_mod });
+    const run_study = b.addRunArtifact(study_tests);
+    run_study.has_side_effects = true;
+    test_step.dependOn(&run_study.step);
+
     const pcre2test_mod = b.createModule(.{
         .root_source_file = b.path("tests/pcre2test.zig"),
         .target = target,
