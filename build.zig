@@ -26,8 +26,30 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     run_unit_tests.has_side_effects = true;
 
-    const test_step = b.step("test", "Run unit tests and PCRE2 oracle");
+    const test_step = b.step("test", "Run Zig unit, spec, and PCRE2 testdata (no C)");
     test_step.dependOn(&run_unit_tests.step);
+
+    const spec_mod = b.createModule(.{
+        .root_source_file = b.path("tests/spec.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zpcre2", .module = zpcre2 }},
+    });
+    const spec_tests = b.addTest(.{ .root_module = spec_mod });
+    const run_spec = b.addRunArtifact(spec_tests);
+    run_spec.has_side_effects = true;
+    test_step.dependOn(&run_spec.step);
+
+    const pcre2test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/pcre2test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zpcre2", .module = zpcre2 }},
+    });
+    const pcre2test_tests = b.addTest(.{ .root_module = pcre2test_mod });
+    const run_pcre2test = b.addRunArtifact(pcre2test_tests);
+    run_pcre2test.has_side_effects = true;
+    test_step.dependOn(&run_pcre2test.step);
 
     const pcre2 = addBundledPcre2(b, target, optimize);
     const pcre2_c = translatePcre2(b, target, optimize, pcre2.header_dir);
@@ -48,9 +70,8 @@ pub fn build(b: *std.Build) void {
     const run_oracle = b.addRunArtifact(oracle_tests);
     run_oracle.has_side_effects = true;
 
-    const oracle_step = b.step("test-oracle", "Differential tests against bundled PCRE2 10.47");
+    const oracle_step = b.step("test-oracle", "Optional live C PCRE2 10.47 differential");
     oracle_step.dependOn(&run_oracle.step);
-    test_step.dependOn(&run_oracle.step);
 
     const bench_optimize: std.builtin.OptimizeMode = .ReleaseFast;
     const zpcre2_fast = b.createModule(.{

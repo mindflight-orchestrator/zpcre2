@@ -49,7 +49,11 @@ pub const Compiled = struct {
     }
 
     pub fn find(self: Compiled, subject: []const u8) ?Match {
-        return findProgram(self.program(), subject, self.study);
+        return self.findFrom(subject, 0);
+    }
+
+    pub fn findFrom(self: Compiled, subject: []const u8, start: usize) ?Match {
+        return findProgramFrom(self.program(), subject, self.study, start);
     }
 
     pub fn isMatch(self: Compiled, subject: []const u8) bool {
@@ -96,7 +100,11 @@ pub const Allocated = struct {
     }
 
     pub fn find(self: Allocated, subject: []const u8) ?Match {
-        return findProgram(self.program(), subject, self.study);
+        return self.findFrom(subject, 0);
+    }
+
+    pub fn findFrom(self: Allocated, subject: []const u8, start: usize) ?Match {
+        return findProgramFrom(self.program(), subject, self.study, start);
     }
 
     pub fn isMatch(self: Allocated, subject: []const u8) bool {
@@ -110,11 +118,20 @@ pub const Allocated = struct {
 };
 
 fn findProgram(program: bytecode.Program, subject: []const u8, study: analyze_mod.Info) ?Match {
+    return findProgramFrom(program, subject, study, 0);
+}
+
+fn findProgramFrom(
+    program: bytecode.Program,
+    subject: []const u8,
+    study: analyze_mod.Info,
+    start: usize,
+) ?Match {
     var buf: [128]?usize = undefined;
     const n = @min(2 * (@as(usize, program.capture_count) + 1), buf.len);
     const slots = buf[0..n];
     @memset(slots, null);
-    return match_mod.find(program, subject, slots, .{}, study);
+    return match_mod.findFrom(program, subject, slots, .{}, study, start);
 }
 
 /// Compile `pattern` at comptime. Invalid patterns fail the build.
@@ -435,6 +452,14 @@ test "unsupported syntax errors" {
 
 test "spec version" {
     try std.testing.expectEqualStrings("10.47", spec_version);
+}
+
+test "findFrom honors lookbehind across the start offset" {
+    var re = try compileAlloc(std.testing.allocator, "(?<=x)a", .{});
+    defer re.deinit();
+    try std.testing.expectEqual(@as(usize, 1), re.findFrom("xaxa", 0).?.start);
+    try std.testing.expectEqual(@as(usize, 3), re.findFrom("xaxa", 2).?.start);
+    try std.testing.expect(re.findFrom("xaxa", 4) == null);
 }
 
 test "unanchored skip finds in the middle of a long haystack" {

@@ -40,7 +40,18 @@ pub const Captures = struct {
 pub const ExecError = error{MatchLimit};
 
 pub fn find(program: Program, subject: []const u8, slots: []?usize, limits: scratch_mod.MatchLimits, info: analyze.Info) ?Match {
-    var caps = findCaptures(program, subject, slots, limits, info) orelse return null;
+    return findFrom(program, subject, slots, limits, info, 0);
+}
+
+pub fn findFrom(
+    program: Program,
+    subject: []const u8,
+    slots: []?usize,
+    limits: scratch_mod.MatchLimits,
+    info: analyze.Info,
+    start: usize,
+) ?Match {
+    var caps = findCapturesFrom(program, subject, slots, limits, info, start) orelse return null;
     return caps.span();
 }
 
@@ -49,8 +60,20 @@ pub fn isMatch(program: Program, subject: []const u8, slots: []?usize, limits: s
 }
 
 pub fn findCaptures(program: Program, subject: []const u8, slots: []?usize, limits: scratch_mod.MatchLimits, info: analyze.Info) ?Captures {
+    return findCapturesFrom(program, subject, slots, limits, info, 0);
+}
+
+pub fn findCapturesFrom(
+    program: Program,
+    subject: []const u8,
+    slots: []?usize,
+    limits: scratch_mod.MatchLimits,
+    info: analyze.Info,
+    start: usize,
+) ?Captures {
+    if (start > subject.len) return null;
     const anchored = isAnchored(program);
-    var pos: usize = 0;
+    var pos: usize = start;
     while (true) {
         const cand = skipToCandidate(subject, pos, info) orelse break;
         if (info.min_length > 0 and cand.start + info.min_length > subject.len) break;

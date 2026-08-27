@@ -1,3 +1,6 @@
+//! Optional live differential tests against bundled C PCRE2 10.47.
+//! Not part of `zig build test`. Run with `zig build test-oracle`.
+
 const std = @import("std");
 const zpcre2 = @import("zpcre2");
 const corpus = @import("corpus.zig");
@@ -47,11 +50,4 @@ test "oracle bench probes" {
             try std.testing.expect(got == null);
         }
     }
-}
-
-test "xfail documented gaps" {
-    try std.testing.expectError(
-        error.UnsupportedSyntax,
-        zpcre2.compileAlloc(std.testing.allocator, "\\C", .{}),
-    );
 }
