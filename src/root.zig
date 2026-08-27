@@ -110,9 +110,10 @@ pub const Allocated = struct {
 };
 
 fn findProgram(program: bytecode.Program, subject: []const u8, study: analyze_mod.Info) ?Match {
-    var buf: [128]?usize = .{null} ** 128;
-    const n = 2 * (@as(usize, program.capture_count) + 1);
-    const slots = if (n <= buf.len) buf[0..n] else buf[0..buf.len];
+    var buf: [128]?usize = undefined;
+    const n = @min(2 * (@as(usize, program.capture_count) + 1), buf.len);
+    const slots = buf[0..n];
+    @memset(slots, null);
     return match_mod.find(program, subject, slots, .{}, study);
 }
 

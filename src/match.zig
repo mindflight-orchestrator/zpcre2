@@ -61,6 +61,7 @@ pub fn findCaptures(program: Program, subject: []const u8, slots: []?usize, limi
             .slots = slots,
             .start_offset = cand.start,
             .limits = limits,
+            .copies = undefined,
         };
         slots[0] = cand.start;
         if (eng.matchAt(0, cand.start)) {
@@ -185,6 +186,18 @@ fn advance(subject: []const u8, pos: usize, utf: bool) usize {
     return pos + n.len;
 }
 
+const copy_frames = 32;
+const copy_slots = 64;
+const CopyStack = [copy_frames][copy_slots]?usize;
+
+threadlocal var tls_copies: CopyStack = undefined;
+
+const Choice = struct {
+    pc: u32,
+    pos: usize,
+    copy_at: u8,
+};
+
 const Engine = struct {
     program: Program,
     subject: []const u8,
@@ -198,10 +211,17 @@ const Engine = struct {
     committed: bool = false,
     skip_to: ?usize = null,
     hit_limit: bool = false,
-    copy_stack: [32][64]?usize = undefined,
+    copies: *CopyStack = undefined,
     copy_depth: u8 = 0,
 
     fn matchAt(self: *Engine, start_pc: u32, start_pos: usize) bool {
+        if (@inComptime()) {
+            var ct_copies: CopyStack = undefined;
+            self.copies = &ct_copies;
+        } else {
+            self.copies = &tls_copies;
+        }
+        self.copy_depth = 0;
         return self.exec(start_pc, @intCast(self.program.ops.len), start_pos, true);
     }
 
@@ -210,13 +230,23 @@ const Engine = struct {
         defer self.depth -= 1;
         if (self.depth > self.limits.depth_limit) return false;
 
+        var choices: [16]Choice = undefined;
+        var nchoice: u8 = 0;
         var pc = start_pc;
         var pos = start_pos;
-        while (pc < end_pc) {
+
+        dispatch: while (true) {
             self.steps += 1;
             if (self.steps > self.limits.match_limit) {
                 self.hit_limit = true;
                 return false;
+            }
+            if (pc >= end_pc) {
+                self.end_pos = pos;
+                if (save_end and pc >= self.program.ops.len) {
+                    if (self.slots.len > 1) self.slots[1] = pos;
+                }
+                return true;
             }
             const inst = self.program.ops[pc];
             switch (inst) {
@@ -227,108 +257,179 @@ const Engine = struct {
                     }
                     return true;
                 },
-                .fail => return false,
+                .fail, .prune, .then => {
+                    if (!self.takeChoice(&choices, &nchoice, &pc, &pos)) return false;
+                    continue :dispatch;
+                },
                 .char => |cp| {
-                    const n = self.consumeChar(pos, cp, false) orelse return false;
-                    pos = n;
+                    pos = self.consumeChar(pos, cp, false) orelse {
+                        if (!self.takeChoice(&choices, &nchoice, &pc, &pos)) return false;
+                        continue :dispatch;
+                    };
                     pc += 1;
                 },
                 .char_i => |cp| {
-                    const n = self.consumeChar(pos, cp, true) orelse return false;
-                    pos = n;
+                    pos = self.consumeChar(pos, cp, true) orelse {
+                        if (!self.takeChoice(&choices, &nchoice, &pc, &pos)) return false;
+                        continue :dispatch;
+                    };
                     pc += 1;
                 },
                 .any => {
-                    const n = self.consumeAny(pos, false) orelse return false;
-                    pos = n;
+                    pos = self.consumeAny(pos, false) orelse {
+                        if (!self.takeChoice(&choices, &nchoice, &pc, &pos)) return false;
+                        continue :dispatch;
+                    };
                     pc += 1;
                 },
                 .any_nl => {
-                    const n = self.consumeAny(pos, true) orelse return false;
-                    pos = n;
+                    pos = self.consumeAny(pos, true) orelse {
+                        if (!self.takeChoice(&choices, &nchoice, &pc, &pos)) return false;
+                        continue :dispatch;
+                    };
                     pc += 1;
                 },
                 .class => |idx| {
-                    const n = self.consumeClass(pos, idx) orelse return false;
-                    pos = n;
+                    pos = self.consumeClass(pos, idx) orelse {
+                        if (!self.takeChoice(&choices, &nchoice, &pc, &pos)) return false;
+                        continue :dispatch;
+                    };
                     pc += 1;
                 },
                 .jmp => |t| pc = t,
                 .split => |alt| {
-                    const saved = self.saveSlots();
-                    if (self.exec(pc + 1, end_pc, pos, save_end)) return true;
-                    if (self.committed) return false;
-                    self.restoreSlots(saved);
-                    if (self.skip_to) |s| {
-                        if (pos < s) return false;
-                    }
-                    pc = alt;
+                    if (nchoice >= choices.len) return false;
+                    _ = self.saveSlots();
+                    choices[nchoice] = .{
+                        .pc = alt,
+                        .pos = pos,
+                        .copy_at = self.copy_depth,
+                    };
+                    nchoice += 1;
+                    pc += 1;
                 },
                 .save => |slot| {
                     if (slot < self.slots.len) self.slots[slot] = pos;
                     pc += 1;
                 },
                 .bol => {
-                    if (!self.isBol(pos)) return false;
+                    if (!self.isBol(pos)) {
+                        if (!self.takeChoice(&choices, &nchoice, &pc, &pos)) return false;
+                        continue :dispatch;
+                    }
                     pc += 1;
                 },
                 .eol => {
-                    if (!self.isEol(pos)) return false;
+                    if (!self.isEol(pos)) {
+                        if (!self.takeChoice(&choices, &nchoice, &pc, &pos)) return false;
+                        continue :dispatch;
+                    }
                     pc += 1;
                 },
                 .bot => {
-                    if (pos != 0) return false;
+                    if (pos != 0) {
+                        if (!self.takeChoice(&choices, &nchoice, &pc, &pos)) return false;
+                        continue :dispatch;
+                    }
                     pc += 1;
                 },
                 .eot => {
-                    if (pos != self.subject.len) return false;
+                    if (pos != self.subject.len) {
+                        if (!self.takeChoice(&choices, &nchoice, &pc, &pos)) return false;
+                        continue :dispatch;
+                    }
                     pc += 1;
                 },
                 .eot_nl => {
-                    if (!self.isEotNl(pos)) return false;
+                    if (!self.isEotNl(pos)) {
+                        if (!self.takeChoice(&choices, &nchoice, &pc, &pos)) return false;
+                        continue :dispatch;
+                    }
                     pc += 1;
                 },
                 .word_boundary => {
-                    if (!self.isWordBoundary(pos)) return false;
+                    if (!self.isWordBoundary(pos)) {
+                        if (!self.takeChoice(&choices, &nchoice, &pc, &pos)) return false;
+                        continue :dispatch;
+                    }
                     pc += 1;
                 },
                 .not_word_boundary => {
-                    if (self.isWordBoundary(pos)) return false;
+                    if (self.isWordBoundary(pos)) {
+                        if (!self.takeChoice(&choices, &nchoice, &pc, &pos)) return false;
+                        continue :dispatch;
+                    }
                     pc += 1;
                 },
                 .start_match => {
-                    if (pos != self.start_offset) return false;
+                    if (pos != self.start_offset) {
+                        if (!self.takeChoice(&choices, &nchoice, &pc, &pos)) return false;
+                        continue :dispatch;
+                    }
                     pc += 1;
                 },
                 .backref => |g| {
-                    pos = self.consumeBackref(pos, g, false) orelse return false;
+                    pos = self.consumeBackref(pos, g, false) orelse {
+                        if (!self.takeChoice(&choices, &nchoice, &pc, &pos)) return false;
+                        continue :dispatch;
+                    };
                     pc += 1;
                 },
                 .backref_i => |g| {
-                    pos = self.consumeBackref(pos, g, true) orelse return false;
+                    pos = self.consumeBackref(pos, g, true) orelse {
+                        if (!self.takeChoice(&choices, &nchoice, &pc, &pos)) return false;
+                        continue :dispatch;
+                    };
                     pc += 1;
                 },
                 .quant => |q| {
-                    return self.execQuant(q, pc + 1, q.body_end, end_pc, pos, save_end);
+                    if (q.possessive) {
+                        switch (self.possessiveAsciiRun(q, pc + 1, q.body_end, pos)) {
+                            .inapplicable => {},
+                            .fail => {
+                                if (!self.takeChoice(&choices, &nchoice, &pc, &pos)) return false;
+                                continue :dispatch;
+                            },
+                            .pos => |p| {
+                                pos = p;
+                                pc = q.body_end;
+                                continue :dispatch;
+                            },
+                        }
+                    }
+                    if (self.execQuant(q, pc + 1, q.body_end, end_pc, pos, save_end)) return true;
+                    if (!self.takeChoice(&choices, &nchoice, &pc, &pos)) return false;
+                    continue :dispatch;
                 },
                 .look => |l| {
                     const ok = self.execLook(l, pc + 1, pos);
-                    if (ok == l.negate) return false;
+                    if (ok == l.negate) {
+                        if (!self.takeChoice(&choices, &nchoice, &pc, &pos)) return false;
+                        continue :dispatch;
+                    }
                     pc = l.end;
                 },
                 .atomic => |aend| {
-                    if (!self.exec(pc + 1, aend, pos, false)) return false;
+                    if (!self.exec(pc + 1, aend, pos, false)) {
+                        if (!self.takeChoice(&choices, &nchoice, &pc, &pos)) return false;
+                        continue :dispatch;
+                    }
                     pos = self.end_pos;
                     pc = aend;
                 },
                 .call => |g| {
-                    if (self.recursion >= self.limits.recursion_limit) return false;
-                    if (g >= self.program.groups.len) return false;
+                    if (self.recursion >= self.limits.recursion_limit or g >= self.program.groups.len) {
+                        if (!self.takeChoice(&choices, &nchoice, &pc, &pos)) return false;
+                        continue :dispatch;
+                    }
                     const range = self.program.groups[g];
                     self.recursion += 1;
                     const ok = self.exec(range.start, range.end, pos, false);
                     self.recursion -= 1;
-                    if (!ok) return false;
+                    if (!ok) {
+                        if (!self.takeChoice(&choices, &nchoice, &pc, &pos)) return false;
+                        continue :dispatch;
+                    }
                     pos = self.end_pos;
                     pc += 1;
                 },
@@ -337,23 +438,28 @@ const Engine = struct {
                     pc += 1;
                 },
                 .newline_seq => {
-                    pos = self.consumeNewlineSeq(pos) orelse return false;
+                    pos = self.consumeNewlineSeq(pos) orelse {
+                        if (!self.takeChoice(&choices, &nchoice, &pc, &pos)) return false;
+                        continue :dispatch;
+                    };
                     pc += 1;
                 },
                 .grapheme => {
-                    pos = self.consumeGrapheme(pos) orelse return false;
+                    pos = self.consumeGrapheme(pos) orelse {
+                        if (!self.takeChoice(&choices, &nchoice, &pc, &pos)) return false;
+                        continue :dispatch;
+                    };
                     pc += 1;
                 },
                 .commit => {
                     self.committed = true;
                     pc += 1;
                 },
-                .prune => return false,
                 .skip => {
                     self.skip_to = pos;
-                    return false;
+                    if (!self.takeChoice(&choices, &nchoice, &pc, &pos)) return false;
+                    continue :dispatch;
                 },
-                .then => return false,
                 .accept_verb => {
                     if (save_end) {
                         self.end_pos = pos;
@@ -367,11 +473,31 @@ const Engine = struct {
                 },
             }
         }
-        self.end_pos = pos;
-        if (save_end and pc >= self.program.ops.len) {
-            if (self.slots.len > 1) self.slots[1] = pos;
+    }
+
+    fn takeChoice(self: *Engine, choices: []Choice, nchoice: *u8, pc: *u32, pos: *usize) bool {
+        if (self.committed) return false;
+        if (nchoice.* == 0) return false;
+        nchoice.* -= 1;
+        const ch = choices[nchoice.*];
+        self.rewindTo(ch.copy_at);
+        pc.* = ch.pc;
+        pos.* = ch.pos;
+        if (self.skip_to) |s| {
+            if (pos.* < s) return false;
         }
         return true;
+    }
+
+    fn rewindTo(self: *Engine, copy_at: u8) void {
+        if (copy_at == 0) {
+            self.copy_depth = 0;
+            return;
+        }
+        const idx = copy_at - 1;
+        const n = @min(self.slots.len, copy_slots);
+        @memcpy(self.slots[0..n], self.copies[idx][0..n]);
+        self.copy_depth = idx;
     }
 
     const AsciiRun = union(enum) {
@@ -707,12 +833,12 @@ const Engine = struct {
     }
 
     fn pushCopy(self: *Engine) []?usize {
-        if (self.copy_depth >= self.copy_stack.len) return &.{};
-        const n = @min(self.slots.len, 64);
+        if (self.copy_depth >= copy_frames) return &.{};
+        const n = @min(self.slots.len, copy_slots);
         const d = self.copy_depth;
         self.copy_depth += 1;
-        @memcpy(self.copy_stack[d][0..n], self.slots[0..n]);
-        return self.copy_stack[d][0..n];
+        @memcpy(self.copies[d][0..n], self.slots[0..n]);
+        return self.copies[d][0..n];
     }
 
     fn popCopy(self: *Engine, saved: []?usize) void {
