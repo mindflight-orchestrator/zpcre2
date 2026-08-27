@@ -39,47 +39,40 @@ pub const Captures = struct {
 
 pub const ExecError = error{MatchLimit};
 
-pub fn find(program: Program, subject: []const u8, slots: []?usize, limits: scratch_mod.MatchLimits) ?Match {
-    var caps = findCaptures(program, subject, slots, limits) orelse return null;
+pub fn find(program: Program, subject: []const u8, slots: []?usize, limits: scratch_mod.MatchLimits, info: analyze.Info) ?Match {
+    var caps = findCaptures(program, subject, slots, limits, info) orelse return null;
     return caps.span();
 }
 
-pub fn isMatch(program: Program, subject: []const u8, slots: []?usize, limits: scratch_mod.MatchLimits) bool {
-    return find(program, subject, slots, limits) != null;
+pub fn isMatch(program: Program, subject: []const u8, slots: []?usize, limits: scratch_mod.MatchLimits, info: analyze.Info) bool {
+    return find(program, subject, slots, limits, info) != null;
 }
 
-pub fn findCaptures(program: Program, subject: []const u8, slots: []?usize, limits: scratch_mod.MatchLimits) ?Captures {
-    const info = analyze.analyze(program);
+pub fn findCaptures(program: Program, subject: []const u8, slots: []?usize, limits: scratch_mod.MatchLimits, info: analyze.Info) ?Captures {
+    const anchored = isAnchored(program);
     var pos: usize = 0;
-    const anchored = program.flags.utf and false;
-    _ = anchored;
     while (true) {
-        if (program.flags.utf == false or true) {
-            if (!tryStart(program, subject, pos, info)) {
-                if (pos >= subject.len) break;
-                pos = advance(subject, pos, program.flags.utf);
-                continue;
-            }
-        }
+        const cand = skipToCandidate(subject, pos, info) orelse break;
+        if (info.min_length > 0 and cand.start + info.min_length > subject.len) break;
         @memset(slots, null);
         var eng = Engine{
             .program = program,
             .subject = subject,
             .slots = slots,
-            .start_offset = pos,
+            .start_offset = cand.start,
             .limits = limits,
         };
-        slots[0] = pos;
-        if (eng.matchAt(0, pos)) {
-            const start = slots[0] orelse pos;
-            const end = slots[1] orelse eng.end_pos;
-            slots[0] = start;
-            slots[1] = end;
+        slots[0] = cand.start;
+        if (eng.matchAt(0, cand.start)) {
+            const mstart = slots[0] orelse cand.start;
+            const mend = slots[1] orelse eng.end_pos;
+            slots[0] = mstart;
+            slots[1] = mend;
             return .{ .subject = subject, .slots = slots };
         }
-        if (pos >= subject.len) break;
-        if (isAnchored(program)) break;
-        pos = advance(subject, pos, program.flags.utf);
+        if (anchored or cand.start >= subject.len) break;
+        pos = cand.next;
+        if (pos <= cand.start) pos = cand.start + 1;
     }
     return null;
 }
@@ -98,20 +91,91 @@ fn isAnchored(program: Program) bool {
     return false;
 }
 
-fn tryStart(program: Program, subject: []const u8, pos: usize, info: analyze.Info) bool {
-    if (info.min_length > 0 and pos + info.min_length > subject.len) {
-        // still allow empty-width? min_length>0 means no
-        if (pos > subject.len) return false;
-        if (pos == subject.len and info.min_length > 0) return false;
+const Candidate = struct {
+    start: usize,
+    next: usize,
+};
+
+fn skipToCandidate(subject: []const u8, pos: usize, info: analyze.Info) ?Candidate {
+    if (pos > subject.len) return null;
+    if (pos == subject.len) {
+        return if (info.min_length == 0) .{ .start = pos, .next = pos + 1 } else null;
+    }
+    if (info.req_byte) |rb| {
+        if (std.mem.findScalarPos(u8, subject, pos, rb)) |at| {
+            var start = at;
+            if (info.has_start_bits) {
+                while (start > pos and bitAt(info.start_bits, subject[start - 1])) start -= 1;
+            }
+            return .{ .start = start, .next = at + 1 };
+        }
+        return null;
     }
     if (info.first_byte) |b| {
-        if (pos >= subject.len) return false;
-        if (program.flags.caseless) {
-            return unicode.asciiFold(subject[pos]) == unicode.asciiFold(b);
+        var p = pos;
+        while (p < subject.len) {
+            const idx = if (info.first_byte2) |b2| blk: {
+                const a = std.mem.findScalarPos(u8, subject, p, b);
+                const c = std.mem.findScalarPos(u8, subject, p, b2);
+                if (a == null and c == null) break :blk null;
+                break :blk @min(a orelse std.math.maxInt(usize), c orelse std.math.maxInt(usize));
+            } else std.mem.findScalarPos(u8, subject, p, b);
+            const found = idx orelse return null;
+            if (prefixMatches(subject, found, info))
+                return .{ .start = found, .next = found + 1 };
+            p = found + 1;
         }
-        return subject[pos] == b;
+        return null;
     }
-    return true;
+    if (info.has_start_bits) {
+        const found = findStartBit(subject, pos, info.start_bits) orelse return null;
+        return .{ .start = found, .next = found + 1 };
+    }
+    return .{ .start = pos, .next = pos + 1 };
+}
+
+fn bitAt(bits: [4]u64, b: u8) bool {
+    return (bits[b >> 6] & (@as(u64, 1) << @as(u6, @truncate(b)))) != 0;
+}
+
+fn prefixMatches(subject: []const u8, idx: usize, info: analyze.Info) bool {
+    if (info.prefix_len < 2) return true;
+    if (idx + info.prefix_len > subject.len) return false;
+    return std.mem.eql(u8, subject[idx..][0..info.prefix_len], info.prefix[0..info.prefix_len]);
+}
+
+fn findStartBit(subject: []const u8, pos: usize, bits: [4]u64) ?usize {
+    const nbits = @as(u16, @popCount(bits[0])) + @as(u16, @popCount(bits[1])) +
+        @as(u16, @popCount(bits[2])) + @as(u16, @popCount(bits[3]));
+    if (nbits == 0) return null;
+    if (nbits <= 8) {
+        var best: usize = std.math.maxInt(usize);
+        var found = false;
+        var b: u16 = 0;
+        while (b < 256) : (b += 1) {
+            const byte: u8 = @intCast(b);
+            if ((bits[byte >> 6] & (@as(u64, 1) << @as(u6, @truncate(byte)))) == 0) continue;
+            if (std.mem.findScalarPos(u8, subject, pos, byte)) |idx| {
+                if (idx < best) best = idx;
+                found = true;
+            }
+        }
+        return if (found) best else null;
+    }
+    var i = pos;
+    while (i + 8 <= subject.len) : (i += 8) {
+        inline for (0..8) |k| {
+            const byte = subject[i + k];
+            if ((bits[byte >> 6] & (@as(u64, 1) << @as(u6, @truncate(byte)))) != 0)
+                return i + k;
+        }
+    }
+    while (i < subject.len) : (i += 1) {
+        const byte = subject[i];
+        if ((bits[byte >> 6] & (@as(u64, 1) << @as(u6, @truncate(byte)))) != 0)
+            return i;
+    }
+    return null;
 }
 
 fn advance(subject: []const u8, pos: usize, utf: bool) usize {
@@ -310,6 +374,52 @@ const Engine = struct {
         return true;
     }
 
+    const AsciiRun = union(enum) {
+        inapplicable,
+        fail,
+        pos: usize,
+    };
+
+    fn possessiveAsciiRun(
+        self: *Engine,
+        q: bytecode.Quant,
+        body_pc: u32,
+        body_end: u32,
+        pos: usize,
+    ) AsciiRun {
+        if (body_end != body_pc + 1) return .inapplicable;
+        switch (self.program.ops[body_pc]) {
+            .char => |cp| {
+                if (cp >= 0x80) return .inapplicable;
+                const want: u8 = @intCast(cp);
+                var n: u32 = 0;
+                var p = pos;
+                while (n < q.max and p < self.subject.len and self.subject[p] == want) {
+                    p += 1;
+                    n += 1;
+                }
+                if (n < q.min) return .fail;
+                return .{ .pos = p };
+            },
+            .class => |idx| {
+                if (idx >= self.program.classes.len) return .inapplicable;
+                const class = self.program.classes[idx];
+                if (class.negated or class.range_count != 0 or class.prop_count != 0) return .inapplicable;
+                var n: u32 = 0;
+                var p = pos;
+                while (n < q.max and p < self.subject.len) {
+                    const b = self.subject[p];
+                    if (b >= 0x80 or !class.matches(b)) break;
+                    p += 1;
+                    n += 1;
+                }
+                if (n < q.min) return .fail;
+                return .{ .pos = p };
+            },
+            else => return .inapplicable,
+        }
+    }
+
     fn execQuant(
         self: *Engine,
         q: bytecode.Quant,
@@ -320,6 +430,11 @@ const Engine = struct {
         save_end: bool,
     ) bool {
         if (q.possessive) {
+            switch (self.possessiveAsciiRun(q, body_pc, body_end, pos)) {
+                .inapplicable => {},
+                .fail => return false,
+                .pos => |p| return self.exec(body_end, rest_end, p, save_end),
+            }
             var n: u32 = 0;
             var p = pos;
             while (n < q.max) {
@@ -434,6 +549,11 @@ const Engine = struct {
     }
 
     fn consumeChar(self: *Engine, pos: usize, want: u21, caseless: bool) ?usize {
+        if (pos >= self.subject.len) return null;
+        if (!caseless and want < 0x80) {
+            if (self.subject[pos] == want) return pos + 1;
+            if (self.subject[pos] < 0x80) return null;
+        }
         const n = unicode.nextCodepoint(self.subject, pos, self.program.flags.utf) orelse return null;
         if (caseless) {
             if (!unicode.equalFold(n.cp, want, self.program.flags.ucp or self.program.flags.utf))
@@ -449,9 +569,16 @@ const Engine = struct {
     }
 
     fn consumeClass(self: *Engine, pos: usize, idx: u16) ?usize {
-        const n = unicode.nextCodepoint(self.subject, pos, self.program.flags.utf) orelse return null;
+        if (pos >= self.subject.len) return null;
         if (idx >= self.program.classes.len) return null;
-        if (!self.program.classes[idx].matches(n.cp)) return null;
+        const class = self.program.classes[idx];
+        const b = self.subject[pos];
+        if (b < 0x80) {
+            if (!class.matches(b)) return null;
+            return pos + 1;
+        }
+        const n = unicode.nextCodepoint(self.subject, pos, self.program.flags.utf) orelse return null;
+        if (!class.matches(n.cp)) return null;
         return pos + n.len;
     }
 
@@ -521,6 +648,15 @@ const Engine = struct {
 
     fn isWordBoundary(self: *Engine, pos: usize) bool {
         const ucp = self.program.flags.ucp;
+        if (!ucp) {
+            const prev_ascii = pos == 0 or self.subject[pos - 1] < 0x80;
+            const next_ascii = pos >= self.subject.len or self.subject[pos] < 0x80;
+            if (prev_ascii and next_ascii) {
+                const prev = pos > 0 and unicode.isAsciiWord(self.subject[pos - 1]);
+                const next = pos < self.subject.len and unicode.isAsciiWord(self.subject[pos]);
+                return prev != next;
+            }
+        }
         const prev = if (pos == 0) false else blk: {
             const cp = prevCodepoint(self.subject, pos, self.program.flags.utf);
             break :blk unicode.isWord(cp, ucp);

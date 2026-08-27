@@ -35,6 +35,7 @@ pub const Compiled = struct {
     capture_count: u32,
     options: Options,
     flags: options_mod.Flags,
+    study: analyze_mod.Info,
 
     pub fn program(self: Compiled) bytecode.Program {
         return .{
@@ -48,7 +49,7 @@ pub const Compiled = struct {
     }
 
     pub fn find(self: Compiled, subject: []const u8) ?Match {
-        return findProgram(self.program(), subject);
+        return findProgram(self.program(), subject, self.study);
     }
 
     pub fn isMatch(self: Compiled, subject: []const u8) bool {
@@ -57,7 +58,7 @@ pub const Compiled = struct {
 
     pub fn captures(self: Compiled, subject: []const u8, sc: *Scratch) ?Captures {
         sc.reset();
-        return match_mod.findCaptures(self.program(), subject, sc.slots, .{});
+        return match_mod.findCaptures(self.program(), subject, sc.slots, .{}, self.study);
     }
 
     pub fn isMatchComptime(self: Compiled, comptime subject: []const u8) bool {
@@ -74,6 +75,7 @@ pub const Allocated = struct {
     capture_count: u32,
     options: Options,
     flags: options_mod.Flags,
+    study: analyze_mod.Info,
 
     pub fn deinit(self: *Allocated) void {
         self.allocator.free(self.ops);
@@ -94,7 +96,7 @@ pub const Allocated = struct {
     }
 
     pub fn find(self: Allocated, subject: []const u8) ?Match {
-        return findProgram(self.program(), subject);
+        return findProgram(self.program(), subject, self.study);
     }
 
     pub fn isMatch(self: Allocated, subject: []const u8) bool {
@@ -103,15 +105,15 @@ pub const Allocated = struct {
 
     pub fn captures(self: Allocated, subject: []const u8, sc: *Scratch) ?Captures {
         sc.reset();
-        return match_mod.findCaptures(self.program(), subject, sc.slots, .{});
+        return match_mod.findCaptures(self.program(), subject, sc.slots, .{}, self.study);
     }
 };
 
-fn findProgram(program: bytecode.Program, subject: []const u8) ?Match {
+fn findProgram(program: bytecode.Program, subject: []const u8, study: analyze_mod.Info) ?Match {
     var buf: [128]?usize = .{null} ** 128;
     const n = 2 * (@as(usize, program.capture_count) + 1);
     const slots = if (n <= buf.len) buf[0..n] else buf[0..buf.len];
-    return match_mod.find(program, subject, slots, .{});
+    return match_mod.find(program, subject, slots, .{}, study);
 }
 
 /// Compile `pattern` at comptime. Invalid patterns fail the build.
@@ -150,14 +152,23 @@ fn compileComptime(comptime pattern: []const u8, comptime opts: Options) Compile
     @memcpy(&names_copy, program.names);
     const names_final = names_copy;
 
-    return .{
+    const compiled = bytecode.Program{
         .ops = &ops_final,
         .classes = &classes_final,
         .groups = &groups_final,
         .names = &names_final,
         .capture_count = program.capture_count,
-        .options = opts,
         .flags = program.flags,
+    };
+    return .{
+        .ops = compiled.ops,
+        .classes = compiled.classes,
+        .groups = compiled.groups,
+        .names = compiled.names,
+        .capture_count = compiled.capture_count,
+        .options = opts,
+        .flags = compiled.flags,
+        .study = analyze_mod.analyze(compiled),
     };
 }
 
@@ -187,6 +198,14 @@ pub fn compileAllocDiag(
     const names = try allocator.dupe(bytecode.NameEntry, program.names);
     errdefer allocator.free(names);
 
+    const compiled = bytecode.Program{
+        .ops = ops,
+        .classes = classes,
+        .groups = groups,
+        .names = names,
+        .capture_count = program.capture_count,
+        .flags = program.flags,
+    };
     return .{
         .allocator = allocator,
         .ops = ops,
@@ -196,6 +215,7 @@ pub fn compileAllocDiag(
         .capture_count = program.capture_count,
         .options = opts,
         .flags = program.flags,
+        .study = analyze_mod.analyze(compiled),
     };
 }
 
@@ -414,6 +434,39 @@ test "unsupported syntax errors" {
 
 test "spec version" {
     try std.testing.expectEqualStrings("10.47", spec_version);
+}
+
+test "unanchored skip finds in the middle of a long haystack" {
+    var re = try compileAlloc(std.testing.allocator, "needle", .{});
+    defer re.deinit();
+    var buf: [4096]u8 = undefined;
+    @memset(&buf, 'x');
+    @memcpy(buf[2000..][0..6], "needle");
+    try std.testing.expectEqual(@as(usize, 2000), re.find(&buf).?.start);
+    try std.testing.expect(re.find("xxxxxxxx") == null);
+}
+
+test "optional first atom still matches" {
+    const re = compile("a*b", .{});
+    try std.testing.expect(re.isMatch("b"));
+    try std.testing.expect(re.isMatch("aaab"));
+    const re2 = compile("a?b", .{});
+    try std.testing.expect(re2.isMatch("b"));
+}
+
+test "analyze prefix and start bits" {
+    const lit = compile("http", .{});
+    const lit_info = analyze.analyze(lit.program());
+    try std.testing.expectEqual(@as(u8, 'h'), lit_info.first_byte.?);
+    try std.testing.expectEqual(@as(u8, 4), lit_info.prefix_len);
+
+    const digits = compile("\\d+", .{});
+    const d_info = analyze.analyze(digits.program());
+    try std.testing.expect(d_info.has_start_bits or d_info.first_byte != null);
+
+    const alt = compile("foo|bar", .{});
+    const a_info = analyze.analyze(alt.program());
+    try std.testing.expect(a_info.first_byte != null or a_info.has_start_bits);
 }
 
 test {

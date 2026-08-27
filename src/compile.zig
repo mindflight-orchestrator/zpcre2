@@ -2,6 +2,7 @@ const ast = @import("ast.zig");
 const bytecode = @import("bytecode.zig");
 const options = @import("options.zig");
 const parse_mod = @import("parse.zig");
+const unicode = @import("unicode.zig");
 
 const Inst = bytecode.Inst;
 const Node = ast.Node;
@@ -91,7 +92,15 @@ pub const Emitter = struct {
                 }
             },
             .concat => |list| {
-                for (self.parser.children(list)) |n| try self.lowerNode(n);
+                const kids = self.parser.children(list);
+                for (kids, 0..) |n, ki| {
+                    const followed: ?u32 = if (ki + 1 < kids.len) kids[ki + 1] else null;
+                    if (self.parser.nodes[n].kind == .repeat) {
+                        try self.lowerRepeat(n, followed);
+                    } else {
+                        try self.lowerNode(n);
+                    }
+                }
             },
             .alt => |list| try self.lowerAlt(list),
             .group => |g| {
@@ -108,17 +117,7 @@ pub const Emitter = struct {
                     try self.lowerNode(g.body);
                 }
             },
-            .repeat => |r| {
-                const qpc = try self.emit(.{ .quant = .{
-                    .min = r.min,
-                    .max = r.max,
-                    .greedy = r.greedy,
-                    .possessive = r.possessive,
-                    .body_end = 0,
-                } });
-                try self.lowerNode(r.inner);
-                self.ops[qpc].quant.body_end = self.pc();
-            },
+            .repeat => try self.lowerRepeat(idx, null),
             .assert => |a| {
                 _ = try self.emit(switch (a) {
                     .bol => .bol,
@@ -176,6 +175,22 @@ pub const Emitter = struct {
                 }
             },
         }
+    }
+
+    fn lowerRepeat(self: *Emitter, idx: u32, followed: ?u32) options.Error!void {
+        var r = self.parser.nodes[idx].kind.repeat;
+        if (!r.possessive and followed != null and atomsDisjoint(self.parser, r.inner, followed.?)) {
+            r.possessive = true;
+        }
+        const qpc = try self.emit(.{ .quant = .{
+            .min = r.min,
+            .max = r.max,
+            .greedy = r.greedy,
+            .possessive = r.possessive,
+            .body_end = 0,
+        } });
+        try self.lowerNode(r.inner);
+        self.ops[qpc].quant.body_end = self.pc();
     }
 
     fn lowerAlt(self: *Emitter, list: ast.List) options.Error!void {
@@ -239,6 +254,57 @@ pub const Emitter = struct {
         self.ops[jmp_pc].jmp = end;
     }
 };
+
+fn atomsDisjoint(parser: *const Parser, inner: u32, next: u32) bool {
+    const a = parser.nodes[firstAtom(parser, inner)].kind;
+    const b = parser.nodes[firstAtom(parser, next)].kind;
+    const caseless = parser.flags.caseless;
+    return switch (a) {
+        .char => |ca| switch (b) {
+            .char => |cb| if (caseless)
+                unicode.asciiFold(ca) != unicode.asciiFold(cb)
+            else
+                ca != cb,
+            .class => |ci| !parser.classes[ci].matches(ca),
+            else => false,
+        },
+        .class => |ci| switch (b) {
+            .char => |cb| !parser.classes[ci].matches(cb),
+            .class => |cj| classesDisjoint(parser.classes[ci], parser.classes[cj]),
+            else => false,
+        },
+        else => false,
+    };
+}
+
+fn firstAtom(parser: *const Parser, idx: u32) u32 {
+    var i = idx;
+    var guard: u8 = 0;
+    while (guard < 16) : (guard += 1) {
+        switch (parser.nodes[i].kind) {
+            .group => |g| i = g.body,
+            .concat => |list| {
+                const kids = parser.children(list);
+                if (kids.len == 0) return i;
+                i = kids[0];
+            },
+            .opt_set => |o| {
+                if (o.body) |body| i = body else return i;
+            },
+            else => return i,
+        }
+    }
+    return i;
+}
+
+fn classesDisjoint(a: bytecode.Class, b: bytecode.Class) bool {
+    if (a.negated or b.negated) return false;
+    if (a.prop_count > 0 or b.prop_count > 0) return false;
+    return (a.bits[0] & b.bits[0]) == 0 and
+        (a.bits[1] & b.bits[1]) == 0 and
+        (a.bits[2] & b.bits[2]) == 0 and
+        (a.bits[3] & b.bits[3]) == 0;
+}
 
 fn apply(e: *Emitter, set: options.Flags, unset: options.Flags) void {
     if (set.caseless) e.flags.caseless = true;
