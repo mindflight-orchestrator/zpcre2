@@ -1,6 +1,7 @@
 //! Study skip: required later literals. Runtime compile, as grep uses.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const zpcre2 = @import("zpcre2");
 
 const inner_ere = "route=/api/item/[[:digit:]]+[[:space:]]+status=500";
@@ -142,4 +143,51 @@ test "chain matcher fills group 0 for inner literal" {
     const line = "xxroute=/api/item/42 status=500yy";
     const caps = re.captures(line, &sc).?;
     try std.testing.expectEqualStrings("route=/api/item/42 status=500", caps.group(0).?);
+}
+
+test "chain jit matches class-plus suffix" {
+    var re = try compile("[a-z]+-needle");
+    defer re.deinit();
+    try std.testing.expect(re.study.chain.n >= 2);
+    if (builtin.cpu.arch == .x86_64 and builtin.os.tag == .linux)
+        try std.testing.expect(re.hasJit());
+
+    try std.testing.expect(re.isMatch("abc-needle"));
+    try std.testing.expect(re.isMatch("xxfoo-needleyy"));
+    try std.testing.expect(!re.isMatch("ABC-needle"));
+    try std.testing.expect(!re.isMatch("-needle"));
+    try std.testing.expect(!re.isMatch("abc-needl"));
+    const m = re.find("xxfoo-needleyy").?;
+    try std.testing.expectEqualStrings("xxfoo-needle", "xxfoo-needleyy"[m.start..m.end]);
+    var sc = try zpcre2.Scratch.init(std.testing.allocator, re.capture_count);
+    defer sc.deinit();
+    const caps = re.captures("xxfoo-needleyy", &sc).?;
+    try std.testing.expectEqual(m.start, caps.span().?.start);
+    try std.testing.expectEqual(m.end, caps.span().?.end);
+    try std.testing.expectEqual(@as(usize, 10), re.findFrom("aa-needle bb-needle", 3).?.start);
+}
+
+test "chain jit matches later-literal inner ere" {
+    var re = try compile(inner_ere);
+    defer re.deinit();
+    if (builtin.cpu.arch == .x86_64 and builtin.os.tag == .linux)
+        try std.testing.expect(re.hasJit());
+    try std.testing.expect(re.find("route=/api/item/1 status=200") == null);
+    const hit = re.find("2026 INFO route=/api/item/9 status=500 latency=3").?;
+    try std.testing.expectEqualStrings(
+        "route=/api/item/9 status=500",
+        "2026 INFO route=/api/item/9 status=500 latency=3"[hit.start..hit.end],
+    );
+}
+
+test "chain jit matches two-way literal alt" {
+    var re = try compile("status=(200|500)");
+    defer re.deinit();
+    if (builtin.cpu.arch == .x86_64 and builtin.os.tag == .linux)
+        try std.testing.expect(re.hasJit());
+    try std.testing.expect(re.isMatch("status=200"));
+    try std.testing.expect(re.isMatch("status=500"));
+    try std.testing.expect(!re.isMatch("status=404"));
+    try std.testing.expect(re.isMatch("2026 INFO host=web-01 route=/api/item/1 status=200 latency=3"));
+    try std.testing.expect(!re.isMatch("2026 INFO host=web-01 route=/api/item/1 status=404 latency=3"));
 }

@@ -1,12 +1,14 @@
 //! zpcre2 — PCRE2 10.47-compatible regular expressions in pure Zig 0.16.
 //!
 //! Compile a pattern at comptime or at runtime; match with a backtracking VM.
+//! Runtime `compileAlloc` may JIT a linear ASCII chain on Linux x86_64.
 
 const std = @import("std");
 const analyze_mod = @import("analyze.zig");
 const ast = @import("ast.zig");
 const bytecode = @import("bytecode.zig");
 const compile_mod = @import("compile.zig");
+const jit_mod = @import("jit.zig");
 const match_mod = @import("match.zig");
 const options_mod = @import("options.zig");
 const parse_mod = @import("parse.zig");
@@ -80,12 +82,18 @@ pub const Allocated = struct {
     options: Options,
     flags: options_mod.Flags,
     study: analyze_mod.Info,
+    jit: jit_mod.Jit = .none,
 
     pub fn deinit(self: *Allocated) void {
+        self.jit.deinit();
         self.allocator.free(self.ops);
         self.allocator.free(self.classes);
         self.allocator.free(self.groups);
         self.allocator.free(self.names);
+    }
+
+    pub fn hasJit(self: Allocated) bool {
+        return self.jit.active();
     }
 
     pub fn program(self: Allocated) bytecode.Program {
@@ -104,6 +112,8 @@ pub const Allocated = struct {
     }
 
     pub fn findFrom(self: Allocated, subject: []const u8, start: usize) ?Match {
+        if (self.jit.find(subject, start)) |m|
+            return .{ .start = m.start, .end = m.end };
         return findProgramFrom(self.program(), subject, self.study, start);
     }
 
@@ -224,6 +234,7 @@ pub fn compileAllocDiag(
         .capture_count = program.capture_count,
         .flags = program.flags,
     };
+    const study = analyze_mod.analyze(compiled);
     return .{
         .allocator = allocator,
         .ops = ops,
@@ -233,7 +244,8 @@ pub fn compileAllocDiag(
         .capture_count = program.capture_count,
         .options = opts,
         .flags = program.flags,
-        .study = analyze_mod.analyze(compiled),
+        .study = study,
+        .jit = jit_mod.compile(compiled, study),
     };
 }
 
@@ -498,6 +510,7 @@ test "analyze prefix and start bits" {
 test {
     _ = ast;
     _ = analyze_mod;
+    _ = jit_mod;
     _ = unicode;
     std.testing.refAllDecls(@This());
 }
