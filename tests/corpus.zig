@@ -125,4 +125,18 @@ pub const bench_cases = [_]BenchCase{
         .filler = "1234567890 !@# $%^ &*\n",
         .match = .{ .start = 0, .end = 5 },
     },
+    .{
+        .name = "status-alt",
+        .pattern = "status=(200|500)",
+        .probe = "x status=500 y",
+        .filler = "2026 INFO route=/api/item/1 status=200 latency=3\n",
+        .match = .{ .start = 2, .end = 12 },
+    },
+    .{
+        .name = "inner-lit",
+        .pattern = "route=/api/item/[[:digit:]]+[[:space:]]+status=500",
+        .probe = "route=/api/item/9 status=500",
+        .filler = "2026 INFO route=/api/item/1 status=200 latency=3\n",
+        .match = .{ .start = 0, .end = 28 },
+    },
 };

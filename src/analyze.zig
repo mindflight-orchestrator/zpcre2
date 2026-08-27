@@ -17,6 +17,30 @@ pub const Info = struct {
     /// skip on the tail.
     req_lit: [32]u8 = undefined,
     req_lit_len: u8 = 0,
+    /// Linear ASCII chain (lits, possessive class runs, 2-way lit alts).
+    /// When set, `find` verifies from the skip atom instead of running the VM.
+    chain: Chain = .{},
+};
+
+pub const ChainAtom = union(enum) {
+    lit: struct { off: u8, len: u8 },
+    cls: struct { idx: u16, min: u32, max: u32 },
+    alt: struct { a_off: u8, a_len: u8, b_off: u8, b_len: u8 },
+};
+
+pub const Chain = struct {
+    atoms: [8]ChainAtom = undefined,
+    n: u8 = 0,
+    lits: [64]u8 = undefined,
+    lit_n: u8 = 0,
+    skip: u8 = 0,
+    /// Bitmask of `.save` slots to set at each atom's start / end (slots 0..15).
+    start_slots: [8]u16 = .{0} ** 8,
+    end_slots: [8]u16 = .{0} ** 8,
+
+    pub fn litSlice(self: *const Chain, off: u8, len: u8) []const u8 {
+        return self.lits[off..][0..len];
+    }
 };
 
 const StartSet = struct {
@@ -112,6 +136,7 @@ pub fn analyze(program: bytecode.Program) Info {
         info.req_byte = requiredLiteral(program, info.start_bits);
     }
     fillRequiredLater(program, &info);
+    fillChain(program, &info);
     return info;
 }
 
@@ -220,6 +245,224 @@ fn fillRequiredLater(program: bytecode.Program, info: *Info) void {
         return;
     info.req_lit = best;
     info.req_lit_len = best_len;
+}
+
+fn fillChain(program: bytecode.Program, info: *Info) void {
+    var chain = Chain{};
+    var pending: [32]u8 = undefined;
+    var pending_n: u8 = 0;
+    var pending_start: u16 = 0;
+    var i: usize = 0;
+
+    const flushPending = struct {
+        fn go(chain_p: *Chain, buf: []const u8, n: *u8, starts: *u16) bool {
+            if (n.* == 0) return true;
+            if (!addLit(chain_p, buf[0..n.*])) return false;
+            n.* = 0;
+            attachStarts(chain_p, starts);
+            return true;
+        }
+    }.go;
+
+    while (i < program.ops.len) {
+        switch (program.ops[i]) {
+            .commit, .reset_start => return,
+            .save => |slot| {
+                if (!flushPending(&chain, &pending, &pending_n, &pending_start)) return;
+                if (slot >= 16) return;
+                const bit: u16 = @as(u16, 1) << @intCast(slot);
+                if (slot % 2 == 0) {
+                    pending_start |= bit;
+                } else {
+                    if (chain.n == 0) return;
+                    chain.end_slots[chain.n - 1] |= bit;
+                }
+                i += 1;
+            },
+            .char => |cp| {
+                if (cp > 127 or pending_n >= pending.len) return;
+                pending[pending_n] = @intCast(cp);
+                pending_n += 1;
+                i += 1;
+            },
+            .quant => |q| {
+                if (!flushPending(&chain, &pending, &pending_n, &pending_start)) return;
+                if (q.min == 0) return;
+                if (q.body_end != i + 2) return;
+                switch (program.ops[i + 1]) {
+                    .class => |idx| {
+                        if (idx >= program.classes.len) return;
+                        const class = program.classes[idx];
+                        if (class.negated or class.range_count != 0 or class.prop_count != 0) return;
+                        if (chain.n >= chain.atoms.len) return;
+                        chain.atoms[chain.n] = .{ .cls = .{ .idx = idx, .min = q.min, .max = q.max } };
+                        chain.n += 1;
+                        attachStarts(&chain, &pending_start);
+                        i = q.body_end;
+                    },
+                    else => return,
+                }
+            },
+            .split => |alt| {
+                if (!flushPending(&chain, &pending, &pending_n, &pending_start)) return;
+                if (alt == 0 or alt > program.ops.len or alt < 1) return;
+                const join = switch (program.ops[alt - 1]) {
+                    .jmp => |t| t,
+                    else => return,
+                };
+                if (join < alt or join > program.ops.len) return;
+                var a_buf: [32]u8 = undefined;
+                var b_buf: [32]u8 = undefined;
+                const a_len = asciiChars(program, i + 1, alt - 1, &a_buf) orelse return;
+                const b_len = asciiChars(program, alt, join, &b_buf) orelse return;
+                if (a_len == 0 or b_len == 0) return;
+                if (chain.lit_n + a_len + b_len > chain.lits.len or chain.n >= chain.atoms.len) return;
+                const a_off = chain.lit_n;
+                @memcpy(chain.lits[a_off..][0..a_len], a_buf[0..a_len]);
+                chain.lit_n += a_len;
+                const b_off = chain.lit_n;
+                @memcpy(chain.lits[b_off..][0..b_len], b_buf[0..b_len]);
+                chain.lit_n += b_len;
+                chain.atoms[chain.n] = .{ .alt = .{
+                    .a_off = a_off,
+                    .a_len = a_len,
+                    .b_off = b_off,
+                    .b_len = b_len,
+                } };
+                chain.n += 1;
+                attachStarts(&chain, &pending_start);
+                i = join;
+            },
+            .jmp => |t| {
+                if (!flushPending(&chain, &pending, &pending_n, &pending_start)) return;
+                if (t <= i) return;
+                i = t;
+            },
+            .accept, .accept_verb => break,
+            else => return,
+        }
+    }
+    if (!flushPending(&chain, &pending, &pending_n, &pending_start)) return;
+    if (pending_start != 0) return;
+    if (chain.n < 2) return;
+
+    var skip: u8 = 0;
+    var best_len: u8 = 0;
+    var found_req = false;
+    var ai: u8 = 0;
+    while (ai < chain.n) : (ai += 1) {
+        switch (chain.atoms[ai]) {
+            .lit => |lit| {
+                const slice = chain.litSlice(lit.off, lit.len);
+                if (info.req_lit_len >= 3 and std.mem.eql(u8, slice, info.req_lit[0..info.req_lit_len])) {
+                    skip = ai;
+                    found_req = true;
+                    best_len = lit.len;
+                } else if (!found_req and lit.len >= best_len) {
+                    skip = ai;
+                    best_len = lit.len;
+                }
+            },
+            else => {},
+        }
+    }
+    if (best_len < 2) return;
+    chain.skip = skip;
+    if (!chainClassesSafe(program, chain)) return;
+    info.chain = chain;
+}
+
+fn attachStarts(chain: *Chain, pending_start: *u16) void {
+    chain.start_slots[chain.n - 1] = pending_start.*;
+    pending_start.* = 0;
+}
+
+fn chainClassesSafe(program: bytecode.Program, chain: Chain) bool {
+    var i: u8 = 0;
+    while (i < chain.n) : (i += 1) {
+        switch (chain.atoms[i]) {
+            .cls => |c| {
+                if (c.idx >= program.classes.len) return false;
+                const class = program.classes[c.idx];
+                if (i > 0 and !classDisjointAtom(program, class, chain, chain.atoms[i - 1], .last))
+                    return false;
+                if (i + 1 < chain.n and !classDisjointAtom(program, class, chain, chain.atoms[i + 1], .first))
+                    return false;
+            },
+            else => {},
+        }
+    }
+    return true;
+}
+
+fn classDisjointAtom(
+    program: bytecode.Program,
+    class: bytecode.Class,
+    chain: Chain,
+    atom: ChainAtom,
+    end: enum { first, last },
+) bool {
+    switch (atom) {
+        .lit => |lit| {
+            const slice = chain.litSlice(lit.off, lit.len);
+            if (slice.len == 0) return false;
+            const b = if (end == .first) slice[0] else slice[slice.len - 1];
+            return !asciiClassBit(class, b);
+        },
+        .cls => |c| {
+            if (c.idx >= program.classes.len) return false;
+            return classesBitsDisjoint(class, program.classes[c.idx]);
+        },
+        .alt => |a| {
+            const sa = chain.litSlice(a.a_off, a.a_len);
+            const sb = chain.litSlice(a.b_off, a.b_len);
+            if (sa.len == 0 or sb.len == 0) return false;
+            const ba = if (end == .first) sa[0] else sa[sa.len - 1];
+            const bb = if (end == .first) sb[0] else sb[sb.len - 1];
+            return !asciiClassBit(class, ba) and !asciiClassBit(class, bb);
+        },
+    }
+}
+
+fn classesBitsDisjoint(a: bytecode.Class, b: bytecode.Class) bool {
+    return (a.bits[0] & b.bits[0]) == 0 and
+        (a.bits[1] & b.bits[1]) == 0 and
+        (a.bits[2] & b.bits[2]) == 0 and
+        (a.bits[3] & b.bits[3]) == 0;
+}
+
+fn asciiClassBit(class: bytecode.Class, b: u8) bool {
+    return b < 0x80 and class.hasBit(b);
+}
+
+fn addLit(chain: *Chain, bytes: []const u8) bool {
+    if (bytes.len == 0) return true;
+    if (chain.n >= chain.atoms.len) return false;
+    if (chain.lit_n + bytes.len > chain.lits.len) return false;
+    const off = chain.lit_n;
+    @memcpy(chain.lits[off..][0..bytes.len], bytes);
+    chain.lit_n += @intCast(bytes.len);
+    chain.atoms[chain.n] = .{ .lit = .{ .off = off, .len = @intCast(bytes.len) } };
+    chain.n += 1;
+    return true;
+}
+
+fn asciiChars(program: bytecode.Program, start: usize, end: usize, buf: *[32]u8) ?u8 {
+    var n: u8 = 0;
+    var i = start;
+    while (i < end) {
+        switch (program.ops[i]) {
+            .save, .commit, .reset_start => i += 1,
+            .char => |cp| {
+                if (cp > 127 or n >= buf.len) return null;
+                buf[n] = @intCast(cp);
+                n += 1;
+                i += 1;
+            },
+            else => return null,
+        }
+    }
+    return n;
 }
 
 fn collect(program: bytecode.Program, start_pc: u32, end_pc: u32, set: *StartSet, depth: u8) void {

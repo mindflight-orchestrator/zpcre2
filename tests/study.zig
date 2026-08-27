@@ -90,3 +90,56 @@ test "findFrom still skips from a mid-buffer offset" {
     try std.testing.expectEqual(first.end + 1, second.start);
     try std.testing.expect(re.findFrom(subject, second.end) == null);
 }
+
+test "chain matcher covers inner literal and status alt" {
+    var inner = try compile(inner_ere);
+    defer inner.deinit();
+    try std.testing.expectEqual(@as(u8, 4), inner.study.chain.n);
+    try std.testing.expectEqual(@as(u8, 3), inner.study.chain.skip);
+
+    var alt = try compile("status=(200|500)");
+    defer alt.deinit();
+    try std.testing.expectEqual(@as(u8, 2), alt.study.chain.n);
+
+    const line200 = "2026 INFO route=/api/item/1 status=200 latency=3";
+    const line500 = "2026 INFO route=/api/item/9 status=500 latency=3";
+    try std.testing.expect(inner.find(line200) == null);
+    const hit = inner.find(line500).?;
+    try std.testing.expectEqualStrings(
+        "route=/api/item/9 status=500",
+        line500[hit.start..hit.end],
+    );
+    try std.testing.expect(alt.isMatch(line200));
+    try std.testing.expect(alt.isMatch(line500));
+    try std.testing.expect(!alt.isMatch("status=404"));
+}
+
+test "study later literal for class-plus suffix" {
+    var re = try compile("[A-Z]+_RESUME");
+    defer re.deinit();
+    try std.testing.expectEqualStrings("_RESUME", reqLit(re.study));
+    try std.testing.expect(re.isMatch("xxxABC_RESUMExxx"));
+}
+
+test "chain matcher fills capture slots" {
+    var re = try compile("status=(200|500)");
+    defer re.deinit();
+    try std.testing.expect(re.study.chain.n >= 2);
+    var sc = try zpcre2.Scratch.init(std.testing.allocator, re.capture_count);
+    defer sc.deinit();
+    const caps = re.captures("x status=500 y", &sc).?;
+    try std.testing.expectEqualStrings("status=500", caps.group(0).?);
+    try std.testing.expectEqualStrings("500", caps.group(1).?);
+    const caps200 = re.captures("status=200", &sc).?;
+    try std.testing.expectEqualStrings("200", caps200.group(1).?);
+}
+
+test "chain matcher fills group 0 for inner literal" {
+    var re = try compile(inner_ere);
+    defer re.deinit();
+    var sc = try zpcre2.Scratch.init(std.testing.allocator, re.capture_count);
+    defer sc.deinit();
+    const line = "xxroute=/api/item/42 status=500yy";
+    const caps = re.captures(line, &sc).?;
+    try std.testing.expectEqualStrings("route=/api/item/42 status=500", caps.group(0).?);
+}

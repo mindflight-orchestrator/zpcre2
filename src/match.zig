@@ -51,6 +51,7 @@ pub fn findFrom(
     info: analyze.Info,
     start: usize,
 ) ?Match {
+    if (info.chain.n >= 2) return chainFind(program, subject, start, info);
     var caps = findCapturesFrom(program, subject, slots, limits, info, start) orelse return null;
     return caps.span();
 }
@@ -71,6 +72,8 @@ pub fn findCapturesFrom(
     info: analyze.Info,
     start: usize,
 ) ?Captures {
+    if (info.chain.n >= 2)
+        return chainCaptures(program, subject, slots, start, info);
     if (start > subject.len) return null;
     const anchored = isAnchored(program);
     var pos: usize = start;
@@ -168,6 +171,159 @@ fn skipToCandidate(subject: []const u8, pos: usize, info: analyze.Info) ?Candida
         return .{ .start = found, .next = found + 1 };
     }
     return .{ .start = pos, .next = pos + 1 };
+}
+
+fn chainFind(program: Program, subject: []const u8, start: usize, info: analyze.Info) ?Match {
+    if (start > subject.len) return null;
+    const chain = info.chain;
+    const needle = switch (chain.atoms[chain.skip]) {
+        .lit => |lit| chain.litSlice(lit.off, lit.len),
+        else => return null,
+    };
+    var search = start;
+    while (search < subject.len) {
+        const rel = std.mem.find(u8, subject[search..], needle) orelse return null;
+        const at = search + rel;
+        if (chainVerify(program, subject, at, chain)) |m| {
+            if (m.start >= start) return m;
+        }
+        search = at + 1;
+    }
+    return null;
+}
+
+fn chainVerify(program: Program, subject: []const u8, skip_at: usize, chain: analyze.Chain) ?Match {
+    var left = skip_at;
+    var right = skip_at;
+    switch (chain.atoms[chain.skip]) {
+        .lit => |lit| right = skip_at + lit.len,
+        else => return null,
+    }
+
+    var i: u8 = chain.skip + 1;
+    while (i < chain.n) : (i += 1) {
+        right = matchAtomFwd(program, subject, right, chain, chain.atoms[i]) orelse return null;
+    }
+    i = chain.skip;
+    while (i > 0) {
+        i -= 1;
+        left = matchAtomBwd(program, subject, left, chain, chain.atoms[i]) orelse return null;
+    }
+    return .{ .start = left, .end = right };
+}
+
+fn chainCaptures(
+    program: Program,
+    subject: []const u8,
+    slots: []?usize,
+    start: usize,
+    info: analyze.Info,
+) ?Captures {
+    const m = chainFind(program, subject, start, info) orelse return null;
+    @memset(slots, null);
+    if (slots.len > 0) slots[0] = m.start;
+    if (slots.len > 1) slots[1] = m.end;
+    const chain = info.chain;
+    var pos = m.start;
+    var ai: u8 = 0;
+    while (ai < chain.n) : (ai += 1) {
+        applySlotBits(slots, chain.start_slots[ai], pos);
+        pos = matchAtomFwd(program, subject, pos, chain, chain.atoms[ai]) orelse return null;
+        applySlotBits(slots, chain.end_slots[ai], pos);
+    }
+    if (pos != m.end) return null;
+    if (slots.len > 0) slots[0] = m.start;
+    if (slots.len > 1) slots[1] = m.end;
+    return .{ .subject = subject, .slots = slots };
+}
+
+fn applySlotBits(slots: []?usize, bits: u16, pos: usize) void {
+    if (bits == 0) return;
+    var slot: u8 = 0;
+    while (slot < 16) : (slot += 1) {
+        if ((bits & (@as(u16, 1) << @intCast(slot))) != 0 and slot < slots.len)
+            slots[slot] = pos;
+    }
+}
+
+fn matchAtomFwd(
+    program: Program,
+    subject: []const u8,
+    pos: usize,
+    chain: analyze.Chain,
+    atom: analyze.ChainAtom,
+) ?usize {
+    switch (atom) {
+        .lit => |lit| {
+            const slice = chain.litSlice(lit.off, lit.len);
+            if (pos + slice.len > subject.len) return null;
+            if (!std.mem.eql(u8, subject[pos..][0..slice.len], slice)) return null;
+            return pos + slice.len;
+        },
+        .cls => |c| {
+            if (c.idx >= program.classes.len) return null;
+            const class = program.classes[c.idx];
+            var n: u32 = 0;
+            var p = pos;
+            while (n < c.max and p < subject.len and asciiClassBit(class, subject[p])) {
+                p += 1;
+                n += 1;
+            }
+            if (n < c.min) return null;
+            return p;
+        },
+        .alt => |a| {
+            if (matchLitAt(subject, pos, chain.litSlice(a.a_off, a.a_len))) |end| return end;
+            return matchLitAt(subject, pos, chain.litSlice(a.b_off, a.b_len));
+        },
+    }
+}
+
+fn matchAtomBwd(
+    program: Program,
+    subject: []const u8,
+    pos: usize,
+    chain: analyze.Chain,
+    atom: analyze.ChainAtom,
+) ?usize {
+    switch (atom) {
+        .lit => |lit| {
+            const slice = chain.litSlice(lit.off, lit.len);
+            if (pos < slice.len) return null;
+            const start = pos - slice.len;
+            if (!std.mem.eql(u8, subject[start..pos], slice)) return null;
+            return start;
+        },
+        .cls => |c| {
+            if (c.idx >= program.classes.len) return null;
+            const class = program.classes[c.idx];
+            var n: u32 = 0;
+            var p = pos;
+            while (n < c.max and p > 0 and asciiClassBit(class, subject[p - 1])) {
+                p -= 1;
+                n += 1;
+            }
+            if (n < c.min) return null;
+            return p;
+        },
+        .alt => |a| {
+            const sa = chain.litSlice(a.a_off, a.a_len);
+            const sb = chain.litSlice(a.b_off, a.b_len);
+            if (pos >= sa.len and std.mem.eql(u8, subject[pos - sa.len .. pos], sa)) return pos - sa.len;
+            if (pos >= sb.len and std.mem.eql(u8, subject[pos - sb.len .. pos], sb)) return pos - sb.len;
+            return null;
+        },
+    }
+}
+
+fn matchLitAt(subject: []const u8, pos: usize, lit: []const u8) ?usize {
+    if (pos + lit.len > subject.len) return null;
+    if (!std.mem.eql(u8, subject[pos..][0..lit.len], lit)) return null;
+    return pos + lit.len;
+}
+
+fn asciiClassBit(class: bytecode.Class, b: u8) bool {
+    return b < 0x80 and class.hasBit(b);
 }
 
 fn bitAt(bits: [4]u64, b: u8) bool {
